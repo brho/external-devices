@@ -31,8 +31,6 @@
 
 #include "ethermii.h"
 
-#warning "put howmany in a common include"
-
 #define HOWMANY(x, y)	(((x)+((y)-1))/(y))
 enum {					/* registers */
 	Idr0		= 0x00,		/* MAC address */
