@@ -1211,6 +1211,8 @@ rtl8169pnp(struct ether* edev)
 		edev->ea[5] = r>>8;
 	}
 
+	edev->tbdf = MKBUS(BusPCI, ctlr->pci->bus, ctlr->pci->dev,
+	                   ctlr->pci->func);
 	edev->attach = rtl8169attach;
 	edev->transmit = rtl8169transmit;
 	edev->interrupt = rtl8169interrupt;

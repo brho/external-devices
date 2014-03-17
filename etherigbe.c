@@ -2083,6 +2083,8 @@ igbepnp(struct ether* edev)
 	/*
 	 * Linkage to the generic ethernet driver.
 	 */
+	edev->tbdf = MKBUS(BusPCI, ctlr->pci->bus, ctlr->pci->dev,
+	                   ctlr->pci->func);
 	edev->attach = igbeattach;
 	edev->transmit = igbetransmit;
 	edev->interrupt = igbeinterrupt;
