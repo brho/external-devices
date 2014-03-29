@@ -502,7 +502,7 @@ typedef void (*Freefn) (struct block *);
 
 typedef struct ctlr Ctlr;
 struct ctlr {
-	uintptr_t port;
+	uintptr_t mmio_paddr;
 	struct pci_device *pcidev;
 	struct ctlr *next;
 	int active;
@@ -583,9 +583,15 @@ struct Rbpool {
 	unsigned int nslow;
 };
 
-#warning "change this to safer versions "
-#define csr32r(c, r)	(*((c)->nic+((r)/4)))
-#define csr32w(c, r, v)	(*((c)->nic+((r)/4)) = (v))
+static inline uint32_t csr32r(struct ctlr *c, uintptr_t reg)
+{
+	return read_mmreg32((uintptr_t)(c->nic + (reg / 4)));
+}
+
+static inline void csr32w(struct ctlr *c, uintptr_t reg, uint32_t val)
+{
+	write_mmreg32((uintptr_t)(c->nic + (reg / 4)), val);
+}
 
 static struct ctlr *i82563ctlr;
 static Rbpool rbtab[Npool];
@@ -671,8 +677,7 @@ static char *cname(struct ctlr *c)
 	return cttab[c->type].name;
 }
 
-static long
-i82563ifstat(struct ether *edev, void *a, long n, unsigned long offset)
+static long i82563ifstat(struct ether* edev, void* a, long n, uint32_t offset)
 {
 	char *s, *p, *e, *stat;
 	int i, r;
@@ -951,14 +956,10 @@ static void i82563txinit(struct ctlr *ctlr)
 	else
 		csr32w(ctlr, Tctl, 0x0F << CtSHIFT | Psp | 66 << ColdSHIFT | Mulr);
 	csr32w(ctlr, Tipg, 6 << 20 | 8 << 10 | 8);	/* yb sez: 0x702008 */
-#warning "fix this pci write"
-#if 0
-	csr32w(ctlr, Tdbal, Pciwaddrl(ctlr->tdba));
-	csr32w(ctlr, Tdbah, Pciwaddrh(ctlr->tdba));
-#endif
+	csr32w(ctlr, Tdbal, paddr_low32(ctlr->tdba));
+	csr32w(ctlr, Tdbah, paddr_high32(ctlr->tdba));
 	csr32w(ctlr, Tdlen, ctlr->ntd * sizeof(Td));
-#warning "barret, prev?"
-	ctlr->tdh = PREV(0, ctlr->ntd);
+	ctlr->tdh = PREV_RING(0, ctlr->ntd);
 	csr32w(ctlr, Tdh, 0);
 	ctlr->tdt = 0;
 	csr32w(ctlr, Tdt, 0);
@@ -979,8 +980,6 @@ static void i82563txinit(struct ctlr *ctlr)
 	csr32w(ctlr, Txdctl, r);
 }
 
-#define Next(x, m)	(((x)+1) & (m))
-
 static int i82563cleanup(struct ether *e)
 {
 	struct block *b;
@@ -990,7 +989,7 @@ static int i82563cleanup(struct ether *e)
 	c = e->ctlr;
 	tdh = c->tdh;
 	m = c->ntd - 1;
-	while (c->tdba[n = Next(tdh, m)].status & Tdd) {
+	while (c->tdba[n = NEXT_RING(tdh, m)].status & Tdd) {
 		tdh = n;
 		if ((b = c->tb[tdh]) != NULL) {
 			c->tb[tdh] = NULL;
@@ -1029,7 +1028,7 @@ static void i82563tproc(void *v)
 	for (;;) {
 		tdh = i82563cleanup(edev);
 
-		if (Next(tdt, m) == tdh) {
+		if (NEXT_RING(tdt, m) == tdh) {
 			ctlr->txdw++;
 			i82563im(ctlr, Txdw);
 			rendez_sleep(&ctlr->trendez, notrim, ctlr);
@@ -1037,14 +1036,11 @@ static void i82563tproc(void *v)
 		}
 		bp = qbread(edev->oq, 100000);
 		td = &ctlr->tdba[tdt];
-#warning "pciwaddr is an offset from the pci window, wtf?"
-#if 0
-		td->addr[0] = Pciwaddrl(bp->rp);
-		td->addr[1] = Pciwaddrh(bp->rp);
-#endif
+		td->addr[0] = paddr_low32(bp->rp);
+		td->addr[1] = paddr_high32(bp->rp);
 		td->control = Ide | Rs | Ifcs | Teop | BLEN(bp);
 		ctlr->tb[tdt] = bp;
-		tdt = Next(tdt, m);
+		tdt = NEXT_RING(tdt, m);
 		wmb_f();
 		csr32w(ctlr, Tdt, tdt);
 	}
@@ -1061,7 +1057,7 @@ static int i82563replenish(struct ctlr *ctlr, int maysleep)
 	m = ctlr->nrd - 1;
 	p = rbtab + ctlr->pool;
 	i = 0;
-	for (; Next(rdt, m) != ctlr->rdh; rdt = Next(rdt, m)) {
+	for (; NEXT_RING(rdt, m) != ctlr->rdh; rdt = NEXT_RING(rdt, m)) {
 		rd = &ctlr->rdba[rdt];
 		if (ctlr->rb[rdt] != NULL) {
 			printk("%s: tx overrun\n", cname(ctlr));
@@ -1083,8 +1079,8 @@ redux:
 		}
 		i++;
 		ctlr->rb[rdt] = bp;
-		rd->addr[0] = Pciwaddrl(bp->rp);
-		rd->addr[1] = Pciwaddrh(bp->rp);
+		rd->addr[0] = paddr_low32(bp->rp);
+		rd->addr[1] = paddr_high32(bp->rp);
 		rd->status = 0;
 		ctlr->rdfree++;
 	}
@@ -1125,8 +1121,8 @@ static void i82563rxinit(struct ctlr *ctlr)
 	if (ctlr->type == i82566)
 		csr32w(ctlr, Pbs, 16);
 
-	csr32w(ctlr, Rdbal, Pciwaddrl(ctlr->rdba));
-	csr32w(ctlr, Rdbah, Pciwaddrh(ctlr->rdba));
+	csr32w(ctlr, Rdbal, paddr_low32(ctlr->rdba));
+	csr32w(ctlr, Rdbah, paddr_high32(ctlr->rdba));
 	csr32w(ctlr, Rdlen, ctlr->nrd * sizeof(Rd));
 	ctlr->rdh = 0;
 	csr32w(ctlr, Rdh, 0);
@@ -1232,7 +1228,7 @@ static void i82563rproc(void *arg)
 			ctlr->rb[rdh] = NULL;
 			rd->status = 0;
 			ctlr->rdfree--;
-			ctlr->rdh = rdh = Next(rdh, m);
+			ctlr->rdh = rdh = NEXT_RING(rdh, m);
 			if (ctlr->nrd - ctlr->rdfree >= 32 || (rim & Rxdmt0))
 				if (i82563replenish(ctlr, 0) == -1)
 					break;
@@ -1288,7 +1284,7 @@ static unsigned int phyread0(struct ctlr *c, int phyno, int reg)
 		phy = csr32r(c, Mdic);
 		if (phy & (MDIe | MDIready))
 			break;
-		microdelay(1);
+		udelay(1);
 	}
 	if ((phy & (MDIe | MDIready)) != MDIready) {
 		printd("%s: phy %d wedged %.8ux\n", cttab[c->type].name, phyno, phy);
@@ -1317,7 +1313,7 @@ static unsigned int phywrite0(struct ctlr *c, int phyno, int reg, uint16_t val)
 		phy = csr32r(c, Mdic);
 		if (phy & (MDIe | MDIready))
 			break;
-		microdelay(1);
+		udelay(1);
 	}
 	if ((phy & (MDIe | MDIready)) != MDIready)
 		return ~0;
@@ -1493,8 +1489,8 @@ static void serdeslproc(void *v)
 
 static void i82563attach(struct ether *edev)
 {
-	ERRSTACK(2);
-	char name[KNAMELEN];
+	ERRSTACK(1);
+	char *name;
 	int i;
 	struct block *bp;
 	struct ctlr *ctlr;
@@ -1541,27 +1537,30 @@ static void i82563attach(struct ether *edev)
 		freeb(bp);
 	}
 
-	snprintf(name, sizeof name, "#l%dl", edev->ctlrno);
+	/* the ktasks should free these names, if they ever exit */
+	name = kmalloc(KNAMELEN, KMALLOC_WAIT);
+	snprintf(name, KNAMELEN, "#l%dlproc", edev->ctlrno);
+
 	if (csr32r(ctlr, Status) & Tbimode)
-		kproc(name, serdeslproc, edev);	/* mac based serdes */
+		ktask(name, serdeslproc, edev);	/* mac based serdes */
 	else if ((csr32r(ctlr, Ctrlext) & Linkmode) == Serdes)
-		kproc(name, pcslproc, edev);	/* phy based serdes */
+		ktask(name, pcslproc, edev);	/* phy based serdes */
 	else if (cttab[ctlr->type].flag & F79phy)
-		kproc(name, phyl79proc, edev);
+		ktask(name, phyl79proc, edev);
 	else
-		kproc(name, phylproc, edev);
+		ktask(name, phylproc, edev);
 
-	snprintf(name, sizeof name, "#l%dr", edev->ctlrno);
-	kproc(name, i82563rproc, edev);
+	snprintf(name, KNAMELEN, "#l%drproc", edev->ctlrno);
+	ktask(name, i82563rproc, edev);
 
-	snprintf(name, sizeof name, "#l%dt", edev->ctlrno);
-	kproc(name, i82563tproc, edev);
+	snprintf(name, KNAMELEN, "#l%dtproc", edev->ctlrno);
+	ktask(name, i82563tproc, edev);
 
 	qunlock(&ctlr->alock);
 	poperror();
 }
 
-static void i82563interrupt(void *unused, void *arg)
+static void i82563interrupt(struct hw_trapframe *hw_tf, void *arg)
 {
 	struct ctlr *ctlr;
 	struct ether *edev;
@@ -1635,7 +1634,7 @@ static int i82563detach(struct ctlr *ctlr)
 			break;
 		if (timeo >= 1000)
 			return -1;
-		delay(1);
+		udelay(1000);
 	}
 
 	r = csr32r(ctlr, Ctrl);
@@ -1643,21 +1642,21 @@ static int i82563detach(struct ctlr *ctlr)
 
 	r = csr32r(ctlr, Ctrlext);
 	csr32w(ctlr, Ctrlext, r | Eerst);
-	delay(1);
+	udelay(1000);
 	for (timeo = 0; timeo < 1000; timeo++) {
 		if (!(csr32r(ctlr, Ctrlext) & Eerst))
 			break;
-		delay(1);
+		udelay(1000);
 	}
 	if (csr32r(ctlr, Ctrlext) & Eerst)
 		return -1;
 
 	csr32w(ctlr, Imc, ~0);
-	delay(1);
+	udelay(1000);
 	for (timeo = 0; timeo < 1000; timeo++) {
 		if ((csr32r(ctlr, Icr) & ~Rxcfg) == 0)
 			break;
-		delay(1);
+		udelay(1000);
 	}
 	if (csr32r(ctlr, Icr) & ~Rxcfg)
 		return -1;
@@ -1673,7 +1672,8 @@ static void i82563shutdown(struct ether *edev)
 static uint16_t eeread(struct ctlr *ctlr, int adr)
 {
 	csr32w(ctlr, Eerd, EEstart | adr << 2);
-	while ((csr32r(ctlr, Eerd) & EEdone) == 0) ;
+	while ((csr32r(ctlr, Eerd) & EEdone) == 0)
+		cpu_relax();
 	return csr32r(ctlr, Eerd) >> 16;
 }
 
@@ -1702,7 +1702,7 @@ static int fcycle(struct ctlr *unused, Flash * f)
 	for (i = 0; i < 10; i++) {
 		if ((s & Scip) == 0)
 			return 0;
-		delay(1);
+		udelay(1000);
 		s = f->reg[Fsts];
 	}
 	return -1;
@@ -1712,7 +1712,7 @@ static int fread(struct ctlr *c, Flash * f, int ladr)
 {
 	uint16_t s;
 
-	delay(1);
+	udelay(1000);
 	if (fcycle(c, f) == -1)
 		return -1;
 	f->reg[Fsts] |= Fdone;
@@ -1732,11 +1732,12 @@ static int fload(struct ctlr *c)
 {
 	unsigned int data, r, adr;
 	uint16_t sum;
-	uintptr_t io;
+	uintptr_t mmio_paddr;
+	struct pci_device *pcidev = c->pcidev;
 	Flash f;
-#warning "flash load, fix this"
-//  io = c->pcidev->mem[1].bar & ~(uintptr_t)0xf;
-//  f.reg = vmap(io, c->pcidev->mem[1].size);
+	mmio_paddr = pcidev->bar[1].mmio_base32 ? pcidev->bar[1].mmio_base32 : 
+	                                          pcidev->bar[1].mmio_base64;
+	f.reg = (void*)vmap_pmem(mmio_paddr, pcidev->bar[1].mmio_sz);
 	if (f.reg == NULL)
 		return -1;
 	f.reg32 = (uint32_t *) f.reg;
@@ -1753,8 +1754,7 @@ static int fload(struct ctlr *c)
 		c->eeprom[adr] = data;
 		sum += data;
 	}
-#warning "vunmap"
-//  vunmap(f.reg, c->pcidev->mem[1].size);
+	vunmap_vmem((uintptr_t)f.reg, c->pcidev->bar[1].mmio_sz);
 	return sum;
 }
 
@@ -1838,7 +1838,7 @@ static struct cmdtab i82563ctlmsg[] = {
 
 static long i82563ctl(struct ether *edev, void *buf, long n)
 {
-	ERRSTACK(2);
+	ERRSTACK(1);
 	char *p;
 	uint32_t v;
 	struct ctlr *ctlr;
@@ -1984,9 +1984,9 @@ static void hbafixup(struct pci_device *p)
 {
 	unsigned int i;
 
-	i = pcicfgr32(p, PciSVID);
-	if ((i & 0xffff) == 0x1b52 && p->did == 1)
-		p->did = i >> 16;
+	i = pcidev_read32(p, PciSVID);
+	if ((i & 0xffff) == 0x1b52 && p->dev_id == 1)
+		p->dev_id = i >> 16;
 }
 
 static void i82563pci(void)
@@ -1996,15 +1996,29 @@ static void i82563pci(void)
 	struct pci_device *p;
 
 	cc = &i82563ctlr;
-	for (p = NULL; p = pcimatch(p, 0x8086, 0);) {
-		hbafixup(p);
-		if ((type = didtype(p->did)) == -1)
+	STAILQ_FOREACH(p, &pci_devices, all_dev) {
+		if (p->ven_id != 0x8086)
 			continue;
-		c = kzmalloc(sizeof *c, 0);
+		hbafixup(p);
+		if ((type = didtype(p->dev_id)) == -1)
+			continue;
+		c = kzmalloc(sizeof *c, KMALLOC_WAIT);
+
+		qlock_init(&c->alock);
+		spinlock_init_irqsave(&c->imlock);
+		rendez_init(&c->lrendez);
+		qlock_init(&c->slock);
+		rendez_init(&c->rrendez);
+		rendez_init(&c->trendez);
+		qlock_init(&c->tlock);
+
 		c->type = type;
 		c->pcidev = p;
 		c->rbsz = cttab[type].mtu;
-		c->port = p->mem[0].bar & ~(uintptr_t) 0xf;
+		/* plan9 called this c->port, and just used the top of the raw bar,
+		 * regardless of the type. */
+		c->mmio_paddr = p->bar[0].mmio_base32 ? p->bar[0].mmio_base32 : 
+		                                        p->bar[0].mmio_base64;
 		*cc = c;
 		cc = &c->next;
 	}
@@ -2019,28 +2033,33 @@ static int setup(struct ctlr *ctlr)
 		return -1;
 	}
 	p = ctlr->pcidev;
-	ctlr->nic = vmap(ctlr->port, p->mem[0].size);
+	ctlr->nic = (void*)vmap_pmem(ctlr->mmio_paddr, p->bar[0].mmio_sz);
 	if (ctlr->nic == NULL) {
-		printd("%s: can't map %#P\n", cname(ctlr), ctlr->port);
+		printd("%s: can't map %p\n", cname(ctlr), ctlr->mmio_paddr);
 		return -1;
 	}
-	pcisetbme(p);
+	pci_set_bus_master(p);
 	if (i82563reset(ctlr)) {
-		vunmap(ctlr->nic, p->mem[0].size);
+		vunmap_vmem((uintptr_t)ctlr->nic, p->bar[0].mmio_sz);
 		return -1;
 	}
 	return 0;
 }
 
+static void i82563_init(void)
+{
+	for (struct Rbpool *rb = rbtab; rb < rbtab + Npool; rb++) {
+		spinlock_init_irqsave(&rb->lock);
+		rendez_init(&rb->r);
+	}
+	i82563pci();
+}
+
 static int pnp(struct ether *edev, int type)
 {
 	struct ctlr *ctlr;
-	static int done;
 
-	if (!done) {
-		i82563pci();
-		done = 1;
-	}
+	run_once(i82563_init());
 
 	/*
 	 * Any adapter matches if no edev->port is supplied,
@@ -2053,7 +2072,7 @@ static int pnp(struct ether *edev, int type)
 			continue;
 		if (type != -1 && ctlr->type != type)
 			continue;
-		if (ethercfgmatch(edev, ctlr->pcidev, ctlr->port) == 0) {
+		if (edev->port == 0 || edev->port == ctlr->mmio_paddr) {
 			ctlr->active = 1;
 			memmove(ctlr->ra, edev->ea, Eaddrlen);
 			if (setup(ctlr) == 0)
@@ -2062,9 +2081,8 @@ static int pnp(struct ether *edev, int type)
 	}
 
 	edev->ctlr = ctlr;
-	edev->port = ctlr->port;
-	edev->irq = ctlr->pcidev->intl;
-	edev->tbdf = ctlr->pcidev->tbdf;
+	edev->port = ctlr->mmio_paddr;
+	edev->irq = ctlr->pcidev->irqline;
 	edev->netif.mbps = 1000;
 	edev->maxmtu = ctlr->rbsz;
 	memmove(edev->ea, ctlr->ra, Eaddrlen);
@@ -2072,6 +2090,8 @@ static int pnp(struct ether *edev, int type)
 	/*
 	 * Linkage to the generic ethernet driver.
 	 */
+	edev->tbdf = MKBUS(BusPCI, ctlr->pcidev->bus, ctlr->pcidev->dev,
+	                   ctlr->pcidev->func);
 	edev->attach = i82563attach;
 	edev->interrupt = i82563interrupt;
 	edev->ifstat = i82563ifstat;
@@ -2090,7 +2110,7 @@ static int anypnp(struct ether *e)
 	return pnp(e, -1);
 }
 
-void ether82563link(void)
+linker_func_3(ether82563link)
 {
 	addethercard("i82563", anypnp);
 }
