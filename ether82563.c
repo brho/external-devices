@@ -2083,6 +2083,8 @@ static int pnp(struct ether *edev, int type)
 	edev->ctlr = ctlr;
 	edev->port = ctlr->mmio_paddr;
 	edev->irq = ctlr->pcidev->irqline;
+	edev->tbdf = MKBUS(BusPCI, ctlr->pcidev->bus, ctlr->pcidev->dev,
+	                   ctlr->pcidev->func);
 	edev->netif.mbps = 1000;
 	edev->maxmtu = ctlr->rbsz;
 	memmove(edev->ea, ctlr->ra, Eaddrlen);
@@ -2090,10 +2092,7 @@ static int pnp(struct ether *edev, int type)
 	/*
 	 * Linkage to the generic ethernet driver.
 	 */
-	edev->tbdf = MKBUS(BusPCI, ctlr->pcidev->bus, ctlr->pcidev->dev,
-	                   ctlr->pcidev->func);
 	edev->attach = i82563attach;
-	edev->interrupt = i82563interrupt;
 	edev->ifstat = i82563ifstat;
 	edev->ctl = i82563ctl;
 
@@ -2102,6 +2101,7 @@ static int pnp(struct ether *edev, int type)
 	edev->shutdown = i82563shutdown;
 	edev->netif.multicast = i82563multicast;
 
+	register_irq(edev->irq, i82563interrupt, edev, edev->tbdf);
 	return 0;
 }
 
